@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Pareto of Subsystem Demand (Last 24 h)</title>
+
+  <!-- 1. Load Highcharts -->
+  <script src="https://code.highcharts.com/highcharts.js"></script>
+
+  <!-- 2. Your mapping of data sources -->
+  <script src="mapping.js"></script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 2rem;
+    }
+    #pareto_div {
+      width: 100%;
+      max-width: 900px;
+      height: 550px;
+      margin: 0 auto;
+    }
+  </style>
+</head>
+<body>
+  <h2>Pareto: Combined Electric &amp; Gas Demand by System</h2>
+  <div id="pareto_div">Loading…</div>
+
+  <script>
+    // Fetch one metric (last point in last 24 h)
+    async function fetchMetric(entry) {
+      const to   = new Date();
+      const from = new Date(to.getTime() - 24*60*60*1000);
+      const body = {
+        query: `
+          query($dataSourceName:String!,$name:String!,$from:String!,$to:String!,
+                $aggregation:MetricDataAggregationMethod!,$window:String!,
+                $samplingWindow:String,$last:Int){
+            dataPoint(dataSourceName:$dataSourceName,name:$name){
+              data(
+                from:$from,to:$to,
+                aggregation:$aggregation,window:$window,
+                samplingWindow:$samplingWindow,last:$last
+              ){
+                nodes{data}
+              }
+            }
+          }
+        `,
+        variables:{
+          dataSourceName: entry.dataSourceName,
+          name:           entry.metricName,
+          from:           from.toISOString(),
+          to:             to.toISOString(),
+          aggregation:    "LAST",
+          window:         "1 minute",
+          samplingWindow: "1 minute",
+          last:           1
+        }
+      };
+      const resp = await fetch('https://sankey-proxy.onrender.com/api/graphql', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+      });
+      const json = await resp.json();
+      const nodes = json?.data?.dataPoint?.data?.nodes || [];
+      return nodes.length ? nodes[0].data : 0;
+    }
+
+    // Build & draw the Pareto chart
+    async function drawPareto() {
+      // 1) fetch all values
+      const all = await Promise.all(
+        sankeyMapping.map(async e => ({
+          system: e.system,
+          source: e.source,
+          value:  await fetchMetric(e)
+        }))
+      );
+
+      // 2) extract mains for leftovers
+      const mainElectric = all.find(r=>r.system==="Main Electric")?.value||0;
+      const mainGas      = all.find(r=>r.system==="Main Gas")?.value||0;
+
+      // 3) group others by system (sum across electric+gas)
+      const groups = {};
+      all.forEach(r => {
+        if (r.system==="Main Electric"||r.system==="Main Gas") return;
+        groups[r.system] = (groups[r.system]||0) + r.value;
+      });
+
+      // 4) compute non-submetered = leftovers of each + combine
+      const sumElecChildren = all.filter(r=>r.source==="electric" && r.system!=="Main Electric")
+                                 .reduce((s,r)=>s+r.value,0);
+      const sumGasChildren  = all.filter(r=>r.source==="gas"      && r.system!=="Main Gas")
+                                 .reduce((s,r)=>s+r.value,0);
+      const nonSubEl = Math.max(mainElectric - sumElecChildren,0);
+      const nonSubGa = Math.max(mainGas      - sumGasChildren,0);
+      const nonSubTotal = nonSubEl + nonSubGa;
+      if (nonSubTotal>0) groups["Non-Submetered"] = nonSubTotal;
+
+      // 5) turn into sorted arrays
+      const data = Object.entries(groups)
+        .map(([sys,val])=>({ system: sys, value: val }))
+        .sort((a,b)=>b.value - a.value);
+
+      const categories = data.map(d=>d.system);
+      const values     = data.map(d=>parseFloat(d.value.toFixed(2)));
+      const total      = values.reduce((s,v)=>s+v,0);
+
+      // 6) cumulative %
+      let cum = 0;
+      const cumPct = values.map(v=>{
+        cum += v;
+        return parseFloat(((cum/total)*100).toFixed(2));
+      });
+
+      // 7) draw
+      Highcharts.chart('pareto_div', {
+        chart: { zoomType: 'xy' },
+        title: { text: '' },
+        xAxis: {
+          categories, crosshair:true,
+          labels:{ rotation:-45 }
+        },
+        yAxis: [{
+          title:{ text:'Demand (kW)' }
+        },{
+          title:{ text:'Cumulative %' },
+          labels:{ format:'{value}%' },
+          opposite:true,
+          max:100
+        }],
+        tooltip:{ shared:true },
+        series: [{
+          type:'column',
+          name:'Demand',
+          data:values,
+          tooltip:{ valueDecimals:2 }
+        },{
+          type:'line',
+          name:'Cumulative %',
+          data:cumPct,
+          yAxis:1,
+          tooltip:{ valueDecimals:2,valueSuffix:'%' }
+        }],
+        credits:{ enabled:false }
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', drawPareto);
+  </script>
+</body>
+</html>
